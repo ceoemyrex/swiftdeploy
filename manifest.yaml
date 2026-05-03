@@ -1,66 +1,49 @@
-# SwiftDeploy Manifest
-# This is the ONLY file you edit directly
-# All other configs are generated from this
-
-version: "1.0"
-app_name: "swift-deploy"
-app_version: "1.0.0"
-
-# Service Configuration
-services:
-  name: api
-  image: swift-deploy-1-node:latest
-  port: 3000
-  mode: stable  # stable or canary
-  restart_policy: unless-stopped
-  healthcheck:
-    endpoint: /healthz
-    interval: 10
-    timeout: 5
-    retries: 3
-
-# Nginx Configuration
-nginx:
-  image: nginx:latest
-  port: 8080
-  proxy_timeout: 30
-  proxy_read_timeout: 30
-  proxy_connect_timeout: 30
-  error_responses:
-    - code: 502
-      message: "Bad Gateway"
-      service: "upstream"
-      contact: "devops@example.com"
-    - code: 503
-      message: "Service Unavailable"
-      service: "api"
-      contact: "devops@example.com"
-    - code: 504
-      message: "Gateway Timeout"
-      service: "upstream"
-      contact: "devops@example.com"
-
-# Network Configuration
-network:
-  name: swiftdeploy-net
-  driver_type: bridge
-
-# Logging
+app_name: swift-deploy
+app_version: 1.0.0
 logging:
   driver: json-file
   options:
-    max-size: "10m"
-    max-file: "3"
-
-# Security
+    max-file: '3'
+    max-size: 10m
+network:
+  driver_type: bridge
+  name: swiftdeploy-net
+nginx:
+  error_responses:
+  - code: 502
+    contact: devops@example.com
+    message: Bad Gateway
+    service: upstream
+  - code: 503
+    contact: devops@example.com
+    message: Service Unavailable
+    service: api
+  - code: 504
+    contact: devops@example.com
+    message: Gateway Timeout
+    service: upstream
+  image: nginx:latest
+  port: 8080
+  proxy_connect_timeout: 30
+  proxy_read_timeout: 30
+  proxy_timeout: 30
 security:
-  non_root_user: appuser
-  capabilities_drop:
-    - ALL
   capabilities_add:
-    - NET_BIND_SERVICE
-
-# Volumes
+  - NET_BIND_SERVICE
+  capabilities_drop:
+  - ALL
+  non_root_user: appuser
+services:
+  healthcheck:
+    endpoint: /healthz
+    interval: 10
+    retries: 3
+    timeout: 5
+  image: swift-deploy-1-node:latest
+  mode: stable
+  name: api
+  port: 3000
+version: '1.0'
 volumes:
   logs:
     driver: local
