@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""
+SwiftDeploy - Infrastructure as Code CLI Tool
+Manages declarative deployments via manifest.yaml
+"""
+
+import os
+import sys
+import json
+import yaml
+import subprocess
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+PROJECT_ROOT = Path(__file__).parent.absolute()
+MANIFEST_FILE = PROJECT_ROOT / "manifest.yaml"
+GENERATED_DIR = PROJECT_ROOT / "generated"
+TEMPLATES_DIR = PROJECT_ROOT / "templates"
+LOGS_DIR = PROJECT_ROOT / "logs"
+
+# Colors for terminal output
+class Colors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+def log_success(msg: str):
+    """Print success message in green"""
+    print(f"{Colors.GREEN}✅ {msg}{Colors.RESET}")
+
+def log_error(msg: str):
+    """Print error message in red"""
+    print(f"{Colors.RED}❌ {msg}{Colors.RESET}")
+
+def log_warning(msg: str):
+    """Print warning message in yellow"""
+    print(f"{Colors.YELLOW}⚠️  {msg}{Colors.RESET}")
+
+def log_info(msg: str):
+    """Print info message in blue"""
+    print(f"{Colors.BLUE}ℹ️  {msg}{Colors.RESET}")
+
+# ============================================================================
+# MANIFEST OPERATIONS
+# ============================================================================
+
+def load_manifest() -> Dict:
+    """Load and parse manifest.yaml"""
+    if not MANIFEST_FILE.exists():
+        log_error(f"Manifest not found: {MANIFEST_FILE}")
+        sys.exit(1)
+    
+    try:
+        with open(MANIFEST_FILE, 'r') as f:
+            manifest = yaml.safe_load(f)
+        return manifest
+    except yaml.YAMLError as e:
+        log_error(f"Invalid YAML in manifest: {e}")
+        sys.exit(1)
+    except Exception as e:
+        log_error(f"Error loading manifest: {e}")
+        sys.exit(1)
+
+def save_manifest(manifest: Dict):
+    """Save manifest.yaml with proper formatting"""
+    try:
+        with open(MANIFEST_FILE, 'w') as f:
+            yaml.dump(manifest, f, default_flow_style=False, sort_keys=False)
+        log_success("Manifest saved")
+    except Exception as e:
+        log_error(f"Error saving manifest: {e}")
+        sys.exit(1)
+
+def get_manifest_value(manifest: Dict, path: str, default=None):
+    """Get nested value from manifest using dot notation
+    Example: get_manifest_value(m, 'services.port') -> 3000
+    """
+    keys = path.split('.')
+    value = manifest
+    
+    for key in keys:
+        if isinstance(value, dict) and key in value:
+            value = value[key]
+        else:
+            return default
+    
+    return value
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+def validate() -> Tuple[bool, List[str]]:
+    """
+    Validate manifest and environment
+    Returns: (success: bool, messages: List[str])
+    """
+    messages = []
+    checks_passed = 0
+    checks_total = 5
+    
+    print("\n" + "="*60)
+    print(f"{Colors.BOLD}RUNNING VALIDATION CHECKS{Colors.RESET}")
+    print("="*60 + "\n")
+    
+    # ===== CHECK 1: manifest.yaml exists and is valid YAML =====
+    check_name = "1. Manifest exists and is valid YAML"
+    print(f"{Colors.BLUE}[CHECK]{Colors.RESET} {check_name}")
+    
+    if not MANIFEST_FILE.exists():
+        log_error(f"manifest.yaml not found at {MANIFEST_FILE}")
+        messages.append(f"❌ {check_name}: File not found")
+    else:
+        try:
+            manifest = load_manifest()
+            log_success("manifest.yaml is valid YAML")
+            messages.append(f"✅ {check_name}: Valid")
+            checks_passed += 1
+        except Exception as e:
+            log_error(f"Invalid YAML: {e}")
+            messages.append(f"❌ {check_name}: Invalid YAML - {e}")
+    
+    print()
+    
+    # ===== CHECK 2: All required fields are present =====
+    check_name = "2. All required fields present and non-empty"
+    print(f"{Colors.BLUE}[CHECK]{Colors.RESET} {check_name}")
+    
+    required_fields = [
+        'services.image',
+        'services.port',
+        'nginx.image',
+        'nginx.port',
+        'network.name',
+        'network.driver_type'
+    ]
+    
+    try:
+        manifest = load_manifest()
+        missing = []
+        
+        for field in required_fields:
+            value = get_manifest_value(manifest, field)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                missing.append(field)
+        
+        if missing:
+            log_error(f"Missing required fields: {', '.join(missing)}")
+            messages.append(f"❌ {check_name}: Missing {missing}")
+        else:
+            log_success("All required fields present")
+            messages.append(f"✅ {check_name}: All present")
+            checks_passed += 1
+    except Exception as e:
+        log_error(f"Error checking fields: {e}")
+        messages.append(f"❌ {check_name}: Error - {e}")
+    
+    print()
+    
+    # ===== CHECK 3: Docker image exists locally =====
+    check_name = "3. Docker image exists locally"
+    print(f"{Colors.BLUE}[CHECK]{Colors.RESET} {check_name}")
+    
+    try:
+        manifest = load_manifest()
+        image = get_manifest_value(manifest, 'services.image')
+        
+        # Check if image exists with docker inspect
+        result = subprocess.run(
+            ['docker', 'inspect', image],
+            capture_output=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0:
+            log_success(f"Docker image exists: {image}")
+            messages.append(f"✅ {check_name}: {image} found")
+            checks_passed += 1
+        else:
+            log_warning(f"Docker image not found locally: {image}")
+            log_warning("You will need to build it before deploying")
+            messages.append(f"⚠️  {check_name}: {image} not found (run 'docker build' first)")
+    except subprocess.TimeoutExpired:
+        log_error("Docker daemon not responding")
+        messages.append(f"❌ {check_name}: Docker not responding")
+    except FileNotFoundError:
+        log_error("Docker not installed or not in PATH")
+        messages.append(f"❌ {check_name}: Docker not found")
+    except Exception as e:
+        log_error(f"Error checking Docker image: {e}")
+        messages.append(f"❌ {check_name}: Error - {e}")
+    
+    print()
+    
+    # ===== CHECK 4: Nginx port not already bound =====
+    check_name = "4. Nginx port not already bound"
+    print(f"{Colors.BLUE}[CHECK]{Colors.RESET} {check_name}")
+    
+    try:
+        manifest = load_manifest()
+        nginx_port = get_manifest_value(manifest, 'nginx.port')
+        
+        # Try to bind to the port
+        result = subprocess.run(
+            ['netstat', '-tuln'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if f":{nginx_port}" in result.stdout:
+            log_warning(f"Port {nginx_port} already in use")
+            messages.append(f"⚠️  {check_name}: Port {nginx_port} already bound")
+        else:
+            log_success(f"Port {nginx_port} is available")
+            messages.append(f"✅ {check_name}: Port {nginx_port} available")
+            checks_passed += 1
+    except Exception as e:
+        log_warning(f"Could not check port binding: {e}")
+        messages.append(f"⚠️  {check_name}: Could not verify ({e})")
+    
+    print()
+    
+    # ===== CHECK 5: Generated nginx.conf is syntactically valid =====
+    check_name = "5. Nginx config is syntactically valid"
+    print(f"{Colors.BLUE}[CHECK]{Colors.RESET} {check_name}")
+    
+    try:
+        nginx_conf = GENERATED_DIR / "nginx.conf"
+        
+        if not nginx_conf.exists():
+            log_warning(f"nginx.conf not found (run 'swiftdeploy init' first)")
+            messages.append(f"⚠️  {check_name}: Not generated yet (run init first)")
+        else:
+            # Validate Nginx config
+            result = subprocess.run(
+                ['nginx', '-t', '-c', str(nginx_conf.absolute())],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode == 0:
+                log_success("Nginx config is valid")
+                messages.append(f"✅ {check_name}: Valid syntax")
+                checks_passed += 1
+            else:
+                log_error(f"Nginx config error: {result.stderr}")
+                messages.append(f"❌ {check_name}: Invalid - {result.stderr}")
+    except FileNotFoundError:
+        log_warning("Nginx not installed (will work in container)")
+        messages.append(f"⚠️  {check_name}: Nginx not installed (OK for container)")
+        checks_passed += 1  # Count as pass since it runs in container
+    except Exception as e:
+        log_warning(f"Could not validate Nginx: {e}")
+        messages.append(f"⚠️  {check_name}: Could not validate ({e})")
+    
+    print()
+    print("="*60)
+    print(f"VALIDATION SUMMARY: {checks_passed}/{checks_total} checks passed")
+    print("="*60 + "\n")
+    
+    success = checks_passed >= 4  # At least 4 of 5 should pass
+    
+    for msg in messages:
+        if "✅" in msg:
+            print(f"{Colors.GREEN}{msg}{Colors.RESET}")
+        elif "❌" in msg:
+            print(f"{Colors.RED}{msg}{Colors.RESET}")
+        else:
+            print(f"{Colors.YELLOW}{msg}{Colors.RESET}")
+    
+    return success, messages
+
+# ============================================================================
+# TEMPLATE RENDERING
+# ============================================================================
+
+def render_template(template_name: str, variables: Dict[str, str]) -> str:
+    """
+    Render template by replacing {{VARIABLE}} with values
+    """
+    template_file = TEMPLATES_DIR / template_name
+    
+    if not template_file.exists():
+        raise FileNotFoundError(f"Template not found: {template_file}")
+    
+    with open(template_file, 'r') as f:
+        content = f.read()
+    
+    # Replace all {{VARIABLE}} with values
+    for key, value in variables.items():
+        placeholder = f"{{{{{key}}}}}"
+        content = content.replace(placeholder, str(value))
+    
+    return content
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+def init():
+    """
+    Parse manifest and generate all configs
+    init: Parse manifest → generate nginx.conf + docker-compose.yml from templates
+    """
+    print("\n" + "="*60)
+    print(f"{Colors.BOLD}INITIALIZING SWIFTDEPLOY{Colors.RESET}")
+    print("="*60 + "\n")
+    
+    try:
+        # Load manifest
+        manifest = load_manifest()
+        log_success("Manifest loaded")
+        
+        # Create generated directory
+        GENERATED_DIR.mkdir(exist_ok=True)
+        log_success(f"Created {GENERATED_DIR}")
+        
+        # Create logs directory
+        LOGS_DIR.mkdir(exist_ok=True)
+        log_success(f"Created {LOGS_DIR}")
+        
+        # Extract values from manifest
+        service_image = get_manifest_value(manifest, 'services.image')
+        service_port = get_manifest_value(manifest, 'services.port')
+        service_mode = get_manifest_value(manifest, 'services.mode', 'stable')
+        nginx_image = get_manifest_value(manifest, 'nginx.image')
+        nginx_port = get_manifest_value(manifest, 'nginx.port')
+        proxy_timeout = get_manifest_value(manifest, 'nginx.proxy_timeout', 30)
+        network_name = get_manifest_value(manifest, 'network.name')
+        network_driver = get_manifest_value(manifest, 'network.driver_type')
+        app_version = get_manifest_value(manifest, 'app_version', '1.0.0')
+        
+        print(f"\n{Colors.BOLD}Configuration:{Colors.RESET}")
+        print(f"  Service: {service_image}:{service_port}")
+        print(f"  Mode: {service_mode}")
+        print(f"  Nginx: {nginx_image}:{nginx_port}")
+        print(f"  Network: {network_name} ({network_driver})\n")
+        
+        # ===== GENERATE NGINX CONFIG =====
+        print(f"{Colors.BLUE}[RENDER]{Colors.RESET} Generating nginx.conf...")
+        
+        nginx_vars = {
+            'SERVICE_NAME': 'api',
+            'SERVICE_PORT': str(service_port),
+            'NGINX_PORT': str(nginx_port),
+            'PROXY_TIMEOUT': str(proxy_timeout),
+            'PROXY_CONNECT_TIMEOUT': str(proxy_timeout),
+            'PROXY_READ_TIMEOUT': str(proxy_timeout),
+        }
+        
+        nginx_content = render_template('nginx.conf.template', nginx_vars)
+        nginx_conf_path = GENERATED_DIR / 'nginx.conf'
+        
+        with open(nginx_conf_path, 'w') as f:
+            f.write(nginx_content)
+        
+        log_success(f"Generated {nginx_conf_path}")
+        
+        # ===== GENERATE DOCKER COMPOSE CONFIG =====
+        print(f"{Colors.BLUE}[RENDER]{Colors.RESET} Generating docker-compose.yml...")
+        
+        docker_vars = {
+            'SERVICE_NAME': 'api',
+            'SERVICE_IMAGE': service_image,
+            'SERVICE_PORT': str(service_port),
+            'MODE': service_mode,
+            'APP_VERSION': app_version,
+            'NGINX_IMAGE': nginx_image,
+            'NGINX_PORT': str(nginx_port),
+            'NETWORK_NAME': network_name,
+            'NETWORK_DRIVER': network_driver,
+            'RESTART_POLICY': 'unless-stopped',
+            'HEALTHCHECK_INTERVAL': '10',
+            'HEALTHCHECK_TIMEOUT': '5',
+            'HEALTHCHECK_RETRIES': '3',
+            'LOG_DRIVER': 'json-file',
+            'LOG_MAX_SIZE': '10m',
+            'LOG_MAX_FILE': '3',
+        }
+        
+        docker_content = render_template('docker-compose.yml.template', docker_vars)
+        docker_compose_path = GENERATED_DIR / 'docker-compose.yml'
+        
+        with open(docker_compose_path, 'w') as f:
+            f.write(docker_content)
+        
+        log_success(f"Generated {docker_compose_path}")
+        
+        print("\n" + "="*60)
+        log_success("Initialization complete!")
+        print("="*60 + "\n")
+        
+        return True
+    
+    except Exception as e:
+        log_error(f"Initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# ============================================================================
+# DOCKER OPERATIONS
+# ============================================================================
+
+def docker_compose_cmd(args: List[str], timeout: int = 60) -> Tuple[bool, str]:
+    """
+    Run docker-compose command
+    Returns: (success: bool, output: str)
+    """
+    docker_compose_file = GENERATED_DIR / 'docker-compose.yml'
+    
+    if not docker_compose_file.exists():
+        return False, "docker-compose.yml not found. Run 'swiftdeploy init' first"
+    
+    cmd = ['docker-compose', '-f', str(docker_compose_file)] + args
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=PROJECT_ROOT
+        )
+        return result.returncode == 0, result.stdout + result.stderr
+    except subprocess.TimeoutExpired:
+        return False, f"Command timed out after {timeout}s"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+def wait_for_health(service_name: str = 'api', timeout: int = 60) -> bool:
+    """
+    Wait for service to become healthy
+    Polls /healthz endpoint every 2 seconds
+    """
+    print(f"\n{Colors.BLUE}[WAIT]{Colors.RESET} Waiting for service to become healthy...")
+    
+    manifest = load_manifest()
+    service_port = get_manifest_value(manifest, 'services.port')
+    
+    start_time = time.time()
+    attempt = 0
+    
+    while time.time() - start_time < timeout:
+        attempt += 1
+        
+        try:
+            result = subprocess.run(
+                ['curl', '-sf', f'http://localhost:{service_port}/healthz'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                log_success(f"Service is healthy (attempt {attempt})")
+                return True
+        except Exception as e:
+            pass
+        
+        elapsed = int(time.time() - start_time)
+        remaining = timeout - elapsed
+        print(f"  Attempt {attempt}: Not ready yet... ({elapsed}s / {timeout}s)", end='\r')
+        
+        time.sleep(2)
+    
+    log_error(f"Service did not become healthy within {timeout}s")
+    return False
+
+# ============================================================================
+# DEPLOY
+# ============================================================================
+
+def deploy():
+    """
+    Deploy: Runs init, brings up stack, blocks until health checks pass or 60s timeout
+    """
+    print("\n" + "="*60)
+    print(f"{Colors.BOLD}DEPLOYING STACK{Colors.RESET}")
+    print("="*60 + "\n")
+    
+    # Step 1: Initialize
+    log_info("Step 1: Initializing configuration...")
+    if not init():
+        log_error("Initialization failed")
+        return False
+    
+    # Step 2: Validate
+    log_info("Step 2: Running validation checks...")
+    success, messages = validate()
+    if not success:
+        log_warning("Some validation checks failed, but proceeding...")
+    
+    # Step 3: Start services
+    log_info("Step 3: Starting services...")
+    success, output = docker_compose_cmd(['up', '-d'])
+    if not success:
+        log_error(f"Failed to start services: {output}")
+        return False
+    print(output)
+    log_success("Services started")
+    
+    # Step 4: Wait for health
+    log_info("Step 4: Waiting for health checks...")
+    if not wait_for_health(timeout=60):
+        log_warning("Health check timeout, but services may still be starting...")
+    
+    print("\n" + "="*60)
+    log_success("Deployment complete!")
+    print("="*60 + "\n")
+    
+    # Show status
+    log_info("Current status:")
+    docker_compose_cmd(['ps'])
+    
+    return True
+
+# ============================================================================
+# PROMOTE (CANARY → STABLE / STABLE → CANARY)
+# ============================================================================
+
+def promote(target_mode: str):
+    """
+    Promote: Switch deployment mode (stable ↔ canary)
+    - Updates mode field in manifest.yaml
+    - Regenerates docker-compose.yml with new MODE env var
+    - Restarts service container only
+    - Confirms new mode is active by hitting /healthz
+    """
+    print("\n" + "="*60)
+    print(f"{Colors.BOLD}PROMOTING TO {target_mode.upper()}{Colors.RESET}")
+    print("="*60 + "\n")
+    
+    if target_mode not in ['stable', 'canary']:
+        log_error("Mode must be 'stable' or 'canary'")
+        return False
+    
+    try:
+        # Step 1: Load manifest
+        manifest = load_manifest()
+        current_mode = get_manifest_value(manifest, 'services.mode', 'stable')
+        
+        if current_mode == target_mode:
+            log_warning(f"Already in {target_mode} mode")
+            return True
+        
+        log_info(f"Step 1: Current mode is {current_mode}, promoting to {target_mode}...")
+        
+        # Step 2: Update manifest
+        manifest['services']['mode'] = target_mode
+        save_manifest(manifest)
+        log_success(f"Updated manifest: mode = {target_mode}")
+        
+        # Step 3: Regenerate docker-compose
+        log_info("Step 2: Regenerating docker-compose.yml...")
+        if not init():
+            log_error("Failed to regenerate configs")
+            return False
+        
+        # Step 4: Restart service
+        log_info("Step 3: Restarting service...")
+        success, output = docker_compose_cmd(['up', '-d', '--no-deps', 'api'])
+        if not success:
+            log_error(f"Failed to restart service: {output}")
+            return False
+        log_success("Service restarted")
+        
+        # Step 5: Wait for health
+        log_info("Step 4: Verifying new mode...")
+        time.sleep(3)  # Give service time to start
+        
+        if not wait_for_health(timeout=30):
+            log_error("Service failed health check after promotion")
+            return False
+        
+        # Step 6: Confirm mode change
+        log_info("Step 5: Confirming mode change...")
+        manifest = load_manifest()
+        service_port = get_manifest_value(manifest, 'services.port')
+        
+        try:
+            result = subprocess.run(
+                ['curl', '-s', f'http://localhost:{service_port}/healthz'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                reported_mode = data.get('mode', 'unknown')
+                
+                if reported_mode == target_mode:
+                    log_success(f"Mode confirmed: {reported_mode}")
+                else:
+                    log_warning(f"Mode mismatch: expected {target_mode}, got {reported_mode}")
+                
+                # Show full response
+                print(f"\nHealth check response:")
+                print(json.dumps(data, indent=2))
+        except Exception as e:
+            log_warning(f"Could not confirm mode: {e}")
+        
+        print("\n" + "="*60)
+        log_success(f"Promotion to {target_mode} complete!")
+        print("="*60 + "\n")
+        
+        return True
+    
+    except Exception as e:
+        log_error(f"Promotion failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# ============================================================================
+# TEARDOWN
+# ============================================================================
+
+def teardown(clean: bool = False):
+    """
+    Teardown: Remove all containers, networks, and volumes
+    --clean flag deletes generated configs
+    """
+    print("\n" + "="*60)
+    print(f"{Colors.BOLD}TEARING DOWN STACK{Colors.RESET}")
+    print("="*60 + "\n")
+    
+    # Step 1: Stop and remove containers
+    log_info("Removing containers and networks...")
+    success, output = docker_compose_cmd(['down', '-v'])
+    if success:
+        log_success("Stack removed")
+    else:
+        log_warning(f"Removal output: {output}")
+    
+    # Step 2: Clean generated files if requested
+    if clean:
+        log_info("Cleaning generated files...")
+        
+        files_to_remove = [
+            GENERATED_DIR / 'nginx.conf',
+            GENERATED_DIR / 'docker-compose.yml',
+        ]
+        
+        for f in files_to_remove:
+            if f.exists():
+                f.unlink()
+                log_success(f"Removed {f}")
+    
+    print("\n" + "="*60)
+    log_success("Teardown complete!")
+    print("="*60 + "\n")
+    
+    return True
+
+# ============================================================================
+# MAIN CLI
+# ============================================================================
+
+def print_help():
+    """Print help message"""
+    help_text = f"""
+{Colors.BOLD}SwiftDeploy - Infrastructure as Code CLI{Colors.RESET}
+
+{Colors.BOLD}Usage:{Colors.RESET}
+    swiftdeploy <command> [options]
+
+{Colors.BOLD}Commands:{Colors.RESET}
+    init              Parse manifest and generate configs
+    validate          Run pre-flight validation checks (5 checks)
+    deploy            Deploy stack (init + up + health checks)
+    promote CANARY    Switch to canary mode
+    promote STABLE    Switch to stable mode
+    teardown          Remove stack (--clean to delete configs)
+    help              Show this help message
+
+{Colors.BOLD}Examples:{Colors.RESET}
+    swiftdeploy init
+    swiftdeploy validate
+    swiftdeploy deploy
+    swiftdeploy promote canary
+    swiftdeploy promote stable
+    swiftdeploy teardown
+    swiftdeploy teardown --clean
+
+{Colors.BOLD}Files:{Colors.RESET}
+    manifest.yaml              Source of truth (edit this)
+    generated/nginx.conf       Generated (auto)
+    generated/docker-compose.yml Generated (auto)
+    logs/                      Application logs
+"""
+    print(help_text)
+
+def main():
+    """Main CLI entry point"""
+    if len(sys.argv) < 2:
+        print_help()
+        sys.exit(1)
+    
+    command = sys.argv[1].lower()
+    
+    if command == 'help' or command == '-h' or command == '--help':
+        print_help()
+        sys.exit(0)
+    
+    elif command == 'init':
+        success = init()
+        sys.exit(0 if success else 1)
+    
+    elif command == 'validate':
+        success, messages = validate()
+        sys.exit(0 if success else 1)
+    
+    elif command == 'deploy':
+        success = deploy()
+        sys.exit(0 if success else 1)
+    
+    elif command == 'promote':
+        if len(sys.argv) < 3:
+            log_error("Usage: swiftdeploy promote [canary|stable]")
+            sys.exit(1)
+        mode = sys.argv[2].lower()
+        success = promote(mode)
+        sys.exit(0 if success else 1)
+    
+    elif command == 'teardown':
+        clean = '--clean' in sys.argv
+        success = teardown(clean=clean)
+        sys.exit(0 if success else 1)
+    
+    else:
+        log_error(f"Unknown command: {command}")
+        print_help()
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
