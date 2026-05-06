@@ -40,10 +40,18 @@ services:
     retries: 3
     timeout: 5
   image: swift-deploy-1-node:latest
-  mode: stable
+  mode: canary
   name: api
   port: 3000
 version: '1.0'
 volumes:
   logs:
     driver: local
+policies:
+  enabled: true
+  directory: ./policies
+  opa_image: openpolicyagent/opa:latest
+  opa_port: 8181
+  checks:
+    pre_deploy: true
+    pre_promote: true
